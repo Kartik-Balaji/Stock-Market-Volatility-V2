@@ -46,6 +46,9 @@ CONFIG = {
     'finetune_epochs': 5,
     'finetune_lr': 0.0001,
     'lookback_days': 250,
+    # Optional universe controls (defaults to full loaded universe)
+    'universe': os.environ.get('CF_UNIVERSE', None),
+    'max_tickers': int(os.environ.get('CF_MAX_TICKERS', '0')),
 }
 
 def setup():
@@ -58,8 +61,12 @@ def load_stocks():
     from data.universe_loader import get_universe_tickers, get_sector_mapping
     with open(CONFIG['config_path'], 'r') as f:
         config = yaml.safe_load(f)
+    if CONFIG['universe']:
+        config['universe']['index'] = CONFIG['universe']
     tickers = get_universe_tickers(config)
     sectors = get_sector_mapping(config)
+    if CONFIG['max_tickers'] and CONFIG['max_tickers'] > 0:
+        tickers = tickers[:CONFIG['max_tickers']]
     return tickers, sectors
 
 def fetch_recent_data(tickers, days=250):
@@ -87,8 +94,10 @@ def compute_features(data, tickers, sectors):
     print("Step 2: Computing Features")
     print("=" * 60)
     
-    features_dict = build_multi_stock_features(data, tickers)
-    tensor, feature_names, dates = features_to_tensor(features_dict, tickers)
+    features_dict = build_multi_stock_features(data, tickers, include_forward_returns=True)
+    model_feature_cols = [c for c in list(features_dict.values())[0].columns if not c.startswith('forward_return')]
+    model_features = {t: df[model_feature_cols] for t, df in features_dict.items()}
+    tensor, feature_names, dates = features_to_tensor(model_features, tickers)
     print(f"✓ Feature tensor: {tensor.shape}")
     
     edge_index, _ = build_graph(features_dict, tickers, sectors, corr_threshold=0.3, max_edges_per_node=5)
@@ -105,6 +114,10 @@ def get_sentiment(tickers):
     print("\n" + "=" * 60)
     print("Step 3: Live Sentiment Analysis")
     print("=" * 60)
+    
+    if os.environ.get('CF_SENTIMENT', '1') == '0':
+        print("  Skipping sentiment (CF_SENTIMENT=0) - using neutral scores.")
+        return torch.zeros(len(tickers), dtype=torch.float32)
     
     sentiment_scores = {}
     try:
@@ -154,6 +167,9 @@ def load_model(num_stocks):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model_config = checkpoint.get('config', {})
     
+    featured = model_config.get('feature_mean')
+    featured_std = model_config.get('feature_std')
+    
     model = CausalFolioMinimal(
         num_features=model_config.get('num_features', 10),
         num_stocks=num_stocks,
@@ -169,7 +185,7 @@ def load_model(num_stocks):
     
     trainer = TrainingModule(model, learning_rate=CONFIG['finetune_lr'], device=device)
     print(f"✓ Model loaded: {checkpoint_path}")
-    return model, trainer, device
+    return model, trainer, device, featured, featured_std, model_config
 
 def compute_targets(features_dict, dates, tickers):
     print("\n" + "=" * 60)
@@ -178,9 +194,15 @@ def compute_targets(features_dict, dates, tickers):
     
     vol_targets_list = []
     ret_values_list = []
+    dates = pd.DatetimeIndex(dates) if not isinstance(dates, pd.DatetimeIndex) else dates
     
     for ticker in tickers:
         df = features_dict.get(ticker, pd.DataFrame())
+        if len(df) != len(dates):
+            try:
+                df = df.reindex(dates)
+            except Exception:
+                pass
         if 'vol_5d' in df.columns:
             vol_targets_list.append(df['vol_5d'].values)
         else:
@@ -237,12 +259,23 @@ def run_daily_update():
     tickers, sectors = load_stocks()
     data = fetch_recent_data(tickers, days=CONFIG['lookback_days'])
     sentiment = get_sentiment(tickers)
-    features, edge_index, features_dict, dates, _ = compute_features(data, tickers, sectors)
+    features, edge_index, features_dict, dates, feature_names = compute_features(data, tickers, sectors)
     
-    model, trainer, device = load_model(len(tickers))
+    model, trainer, device, feature_mean, feature_std, model_config = load_model(len(tickers))
     vol_targets, dir_targets = compute_targets(features_dict, dates, tickers)
     
     min_len = min(features.shape[0], vol_targets.shape[0], dir_targets.shape[0])
+    
+    if feature_mean is not None and feature_std is not None:
+        from features.classical import apply_preprocessing
+        feature_names_config = model_config.get('feature_names')
+        features = apply_preprocessing(
+            features[:min_len].float(),
+            feature_names_config if feature_names_config is not None else feature_names,
+            feature_mean,
+            feature_std,
+            market_neutralized=model_config.get('market_neutralized', False)
+        )
     
     print("\n" + "=" * 60)
     print("Step 6: Fine-tuning")
@@ -259,6 +292,9 @@ def run_daily_update():
         verbose=True
     )
     
-    trainer.save_checkpoint(os.path.join(CONFIG['checkpoint_dir'], CONFIG['model_name']))
+    trainer.save_checkpoint(
+        os.path.join(CONFIG['checkpoint_dir'], CONFIG['model_name']),
+        extra_config={'feature_mean': feature_mean, 'feature_std': feature_std}
+    )
     
     return predict(model, features, edge_index, sentiment, tickers, device)

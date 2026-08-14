@@ -211,7 +211,7 @@ def get_predictions(tickers, sectors, data):
     from models.model_minimal import CausalFolioMinimal
     
     features_dict = build_multi_stock_features(data, tickers)
-    tensor, _, _, valid_tickers, aligned_features = build_features_tensor_strict(features_dict, tickers)
+    tensor, feature_names_built, _, valid_tickers, aligned_features = build_features_tensor_strict(features_dict, tickers)
     sector_map = {t: sectors.get(t, 'Unknown') for t in valid_tickers}
     edge_index, _ = build_graph(aligned_features, valid_tickers, sector_map, corr_threshold=0.3, max_edges_per_node=5)
     
@@ -232,19 +232,32 @@ def get_predictions(tickers, sectors, data):
     
     checkpoint_path = os.path.join(CONFIG['checkpoint_dir'], CONFIG['model_name'])
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model_config = checkpoint.get('config', {})
     
     model = CausalFolioMinimal(
-        num_features=checkpoint.get('config', {}).get('num_features', 10),
+        num_features=model_config.get('num_features', 10),
         num_stocks=len(valid_tickers),
-        gnn_hidden=checkpoint.get('config', {}).get('gnn_hidden', 32),
-        gnn_output=checkpoint.get('config', {}).get('gnn_output', 16),
-        tcn_hidden=checkpoint.get('config', {}).get('tcn_hidden', 32),
-        tcn_layers=checkpoint.get('config', {}).get('tcn_layers', 4),
-        dropout=checkpoint.get('config', {}).get('dropout', 0.2),
+        gnn_hidden=model_config.get('gnn_hidden', 32),
+        gnn_output=model_config.get('gnn_output', 16),
+        tcn_hidden=model_config.get('tcn_hidden', 32),
+        tcn_layers=model_config.get('tcn_layers', 4),
+        dropout=model_config.get('dropout', 0.2),
         use_sentiment=True
     )
     model.load_state_dict(checkpoint['model_state'])
     model = model.to(device).eval()
+    
+    feature_mean = model_config.get('feature_mean')
+    feature_std = model_config.get('feature_std')
+    feature_names_config = model_config.get('feature_names')
+    from features.classical import apply_preprocessing
+    tensor = apply_preprocessing(
+        tensor.float(),
+        feature_names_config if feature_names_config is not None else feature_names_built,
+        feature_mean,
+        feature_std,
+        market_neutralized=model_config.get('market_neutralized', False)
+    )
     
     with torch.no_grad():
         outputs = model(tensor.to(device), edge_index.to(device), sentiment.to(device))

@@ -152,6 +152,7 @@ class CausalFolioMinimal(nn.Module):
             'gnn_output': gnn_output,
             'tcn_hidden': tcn_hidden,
             'tcn_layers': tcn_layers,
+            'dropout': dropout,
             'output_dim': output_dim,
             'use_sentiment': use_sentiment,
             'classification_output': True,  # v3: direction is classification
@@ -434,10 +435,15 @@ class TrainingModule:
         edge_index: torch.Tensor,
         vol_targets: torch.Tensor,
         direction_labels: torch.Tensor,
-        sentiment: Optional[torch.Tensor] = None
+        sentiment: Optional[torch.Tensor] = None,
+        warmup: int = 0
     ) -> Tuple[float, Dict[str, torch.Tensor]]:
         """
         Validate the model with DUAL TARGETS (classification).
+        
+        Args:
+            warmup: Number of leading timesteps whose predictions are ignored
+                    (receptive field rows where the TCN lacks full context).
         
         Returns:
             Tuple of (combined_loss, predictions_dict)
@@ -453,11 +459,13 @@ class TrainingModule:
         
         outputs = self.model(features, edge_index, sentiment)
         
-        # Volatility loss (MSE)
-        vol_loss = self.vol_criterion(outputs['volatility'], vol_targets)
+        # Volatility loss (MSE) - skip warmup rows from predictions only;
+        # targets are already aligned by the caller (train passes targets[train_size:]).
+        vol_preds = outputs['volatility'][warmup:]
+        vol_loss = self.vol_criterion(vol_preds, vol_targets)
         
-        # Direction loss (CrossEntropy)
-        dir_logits = outputs['direction']  # [T, N, 3]
+        # Direction loss (CrossEntropy) - skip warmup rows from predictions only
+        dir_logits = outputs['direction'][warmup:]  # [T, N, 3]
         T, N, C = dir_logits.shape
         dir_logits_flat = dir_logits.view(-1, C)
         dir_labels_flat = direction_labels.view(-1).long()
@@ -508,6 +516,7 @@ class TrainingModule:
         T = features.shape[0]
         val_size = int(T * val_split)
         train_size = T - val_size
+        rf = self.model.get_receptive_field()
         
         # Setup weighted loss if weights provided
         if class_weights is not None:
@@ -520,9 +529,12 @@ class TrainingModule:
         train_features = features[:train_size]
         train_vol_targets = vol_targets[:train_size]
         train_dir_labels = direction_labels[:train_size]
-        val_features = features[train_size:]
+        # Include rf-lookback context before the validation window so the TCN
+        # has full causal context at the start of the validation set.
+        val_features = features[max(0, train_size - rf):]
         val_vol_targets = vol_targets[train_size:]
         val_dir_labels = direction_labels[train_size:]
+        val_warmup = min(rf, train_size)
         
         if sentiment is not None:
             if sentiment.dim() == 1:
@@ -530,7 +542,7 @@ class TrainingModule:
                 val_sentiment = sentiment
             else:
                 train_sentiment = sentiment[:train_size]
-                val_sentiment = sentiment[train_size:]
+                val_sentiment = sentiment[max(0, train_size - rf):]
         else:
             train_sentiment = None
             val_sentiment = None
@@ -553,9 +565,10 @@ class TrainingModule:
                 train_features, edge_index, train_vol_targets, train_dir_labels, train_sentiment
             )
             
-            # Validate
+            # Validate (with warmup removal so val loss is fair)
             val_loss, _ = self.validate(
-                val_features, edge_index, val_vol_targets, val_dir_labels, val_sentiment
+                val_features, edge_index, val_vol_targets, val_dir_labels, val_sentiment,
+                warmup=val_warmup
             )
             
             # Update scheduler
@@ -596,12 +609,15 @@ class TrainingModule:
         
         return history
     
-    def save_checkpoint(self, path: str):
+    def save_checkpoint(self, path: str, extra_config: Optional[Dict] = None):
         """Save model checkpoint."""
+        config = dict(self.model.config)
+        if extra_config:
+            config.update(extra_config)
         torch.save({
             'model_state': self.model.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
-            'config': self.model.config
+            'config': config
         }, path)
         print(f"✓ Checkpoint saved to {path}")
     

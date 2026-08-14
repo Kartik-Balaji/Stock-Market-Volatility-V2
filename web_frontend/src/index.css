@@ -1,26 +1,285 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/* ============================================================
+   CausalFolio — Custom Visual Design System
+   ============================================================ */
+
+/* ---------- Base ---------- */
+:root {
+  --cf-bg: #06060a;
+  --cf-surface: #0d0d12;
+  --cf-card: #121218;
+  --cf-border: rgba(255,255,255,0.06);
+  --cf-accent: #6366f1;
+  --cf-accent2: #a855f7;
+  --cf-glow: rgba(99,102,241,0.15);
+}
+
+html { background: var(--cf-bg); color-scheme: dark; }
 
 body {
   margin: 0;
-  display: flex;
-  place-items: center;
-  min-width: 320px;
   min-height: 100vh;
+  background: var(--cf-bg);
+  font-family: 'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
+  color: #e2e8f0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-/* Custom Webkit scrollbar for the dark sidebar */
+/* ---------- Animated mesh gradient background ---------- */
+.mesh-bg {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background:
+    radial-gradient(ellipse 600px 400px at 20% 10%, rgba(99,102,241,0.08), transparent),
+    radial-gradient(ellipse 500px 500px at 80% 80%, rgba(168,85,247,0.06), transparent),
+    radial-gradient(ellipse 400px 300px at 50% 50%, rgba(59,130,246,0.04), transparent);
+  animation: meshShift 20s ease-in-out infinite alternate;
+}
+@keyframes meshShift {
+  0%   { background-position: 0% 0%, 100% 100%, 50% 50%; }
+  100% { background-position: 30% 20%, 70% 60%, 20% 80%; }
+}
+
+/* ---------- Noise texture overlay ---------- */
+.noise-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  opacity: 0.025;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  pointer-events: none;
+}
+
+/* ---------- Glow card ---------- */
+.glow-card {
+  position: relative;
+  border-radius: 1rem;
+  background: var(--cf-card);
+  border: 1px solid var(--cf-border);
+  overflow: hidden;
+  transition: box-shadow 0.3s ease, border-color 0.3s ease;
+}
+.glow-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(135deg, rgba(99,102,241,0.15), transparent 40%, transparent 60%, rgba(168,85,247,0.1));
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+.glow-card:hover::before { opacity: 1; }
+.glow-card:hover {
+  box-shadow: 0 0 30px rgba(99,102,241,0.08), 0 8px 32px rgba(0,0,0,0.3);
+  border-color: rgba(99,102,241,0.15);
+}
+
+/* ---------- Grid dot pattern ---------- */
+.dot-pattern {
+  background-image: radial-gradient(rgba(255,255,255,0.04) 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+
+/* ---------- Signal pill badges ---------- */
+.signal-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 9999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.signal-pill.up {
+  background: rgba(52,211,153,0.1);
+  color: #34d399;
+  border: 1px solid rgba(52,211,153,0.2);
+  box-shadow: 0 0 12px rgba(52,211,153,0.08);
+}
+.signal-pill.down {
+  background: rgba(251,113,133,0.1);
+  color: #fb7185;
+  border: 1px solid rgba(251,113,133,0.2);
+  box-shadow: 0 0 12px rgba(251,113,133,0.08);
+}
+.signal-pill.sideways {
+  background: rgba(148,163,184,0.1);
+  color: #94a3b8;
+  border: 1px solid rgba(148,163,184,0.15);
+}
+
+/* ---------- Animated border gradient ---------- */
+@keyframes borderRotate {
+  0%   { --angle: 0deg; }
+  100% { --angle: 360deg; }
+}
+
+/* ---------- Floating pulse ring ---------- */
+.pulse-ring {
+  position: relative;
+}
+.pulse-ring::after {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  border: 2px solid transparent;
+  background: conic-gradient(from 0deg, transparent 0%, rgba(99,102,241,0.4) 10%, transparent 20%) border-box;
+  -webkit-mask: linear-gradient(#fff 0 0) padding-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  animation: spin 3s linear infinite;
+  pointer-events: none;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ---------- Scrollbar ---------- */
 .custom-scrollbar::-webkit-scrollbar {
-  width: 6px;
+  width: 5px;
 }
 .custom-scrollbar::-webkit-scrollbar-track {
   background: transparent;
 }
 .custom-scrollbar::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(255,255,255,0.08);
   border-radius: 10px;
 }
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: rgba(255,255,255,0.15);
+}
+
+/* ---------- Stagger fade-in for table rows ---------- */
+@keyframes fadeInRow {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.table-row-enter {
+  animation: fadeInRow 0.25s ease-out both;
+}
+
+/* ---------- Stat card shine ---------- */
+.stat-shine {
+  position: relative;
+  overflow: hidden;
+}
+.stat-shine::after {
+  content: '';
+  position: absolute;
+  top: -50%;
+  left: -60%;
+  width: 40%;
+  height: 200%;
+  background: linear-gradient(100deg, transparent, rgba(255,255,255,0.03), transparent);
+  transform: skewX(-15deg);
+  transition: left 0.6s ease;
+  pointer-events: none;
+}
+.stat-shine:hover::after {
+  left: 120%;
+}
+
+/* ---------- Ticker row hover ---------- */
+.ticker-row {
+  transition: all 0.15s ease;
+  border-left: 3px solid transparent;
+}
+.ticker-row:hover {
+  background: rgba(99,102,241,0.06);
+  border-left-color: rgba(99,102,241,0.4);
+  padding-left: 1.1rem;
+}
+.ticker-row.active {
+  background: rgba(99,102,241,0.1);
+  border-left-color: #6366f1;
+}
+
+/* ---------- Forecast line glow ---------- */
+.forecast-glow {
+  filter: drop-shadow(0 0 4px rgba(52,211,153,0.4));
+}
+.forecast-glow.down {
+  filter: drop-shadow(0 0 4px rgba(251,113,133,0.4));
+}
+
+/* ---------- Navbar glass ---------- */
+.navbar-glass {
+  background: rgba(6,6,10,0.75);
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+
+/* ---------- Button hover glow ---------- */
+.btn-glow {
+  position: relative;
+  overflow: hidden;
+  transition: all 0.2s ease;
+}
+.btn-glow::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, rgba(255,255,255,0.1), transparent);
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+.btn-glow:hover::before { opacity: 1; }
+.btn-glow:active { transform: scale(0.97); }
+
+/* ---------- Training log pre ---------- */
+.train-log {
+  font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  color: #94a3b8;
+  background: rgba(0,0,0,0.4);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 0.75rem;
+  padding: 1rem;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+/* ---------- Chart tooltip ---------- */
+.recharts-tooltip-wrapper {
+  filter: drop-shadow(0 8px 24px rgba(0,0,0,0.5));
+}
+
+/* ---------- Skeleton shimmer ---------- */
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.skeleton {
+  background: linear-gradient(90deg, #15151a 25%, #1e1e28 50%, #15151a 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: 0.5rem;
+}
+
+/* ---------- Empty state ---------- */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 3rem;
+  color: #475569;
+}
+
+/* ---------- Responsive helpers ---------- */
+@media (max-width: 1024px) {
+  .overview-table { max-height: 320px; }
 }

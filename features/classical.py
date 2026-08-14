@@ -227,7 +227,8 @@ def build_node_features(
 
 def build_multi_stock_features(
     data: pd.DataFrame,
-    tickers: List[str]
+    tickers: List[str],
+    include_forward_returns: bool = False
 ) -> Dict[str, pd.DataFrame]:
     """
     Build features for multiple stocks.
@@ -236,6 +237,8 @@ def build_multi_stock_features(
         data: DataFrame with MultiIndex columns from yfinance.
               Handles both (ticker, OHLCV) and (OHLCV, ticker) structures.
         tickers: List of ticker symbols
+        include_forward_returns: If True, also add forward_return_5d/20d columns
+                                 (needed for target computation).
     
     Returns:
         Dict mapping ticker -> feature DataFrame
@@ -269,7 +272,7 @@ def build_multi_stock_features(
                 # Single stock download (no MultiIndex)
                 stock_data = data
             
-            features[ticker] = build_node_features(stock_data)
+            features[ticker] = build_node_features(stock_data, include_forward_returns=include_forward_returns)
             print(f"  ✓ {ticker}: {features[ticker].shape[1]} features")
         except Exception as e:
             print(f"  ✗ {ticker}: Error - {e}")
@@ -368,6 +371,97 @@ def normalize_features(tensor: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
     stats = {'mean': means, 'std': stds}
     
     return normalized, stats
+
+
+def apply_normalization(
+    tensor: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor
+) -> torch.Tensor:
+    """
+    Apply saved z-score normalization stats to a feature tensor.
+    
+    Used at inference time so features are scaled exactly as during training.
+    
+    Args:
+        tensor: Raw feature tensor [T, N, F]
+        mean: Per-feature mean [F] (from checkpoint)
+        std: Per-feature std [F] (from checkpoint)
+    
+    Returns:
+        Normalized tensor
+    """
+    if mean is None or std is None:
+        return tensor
+    mean = torch.as_tensor(mean, dtype=torch.float32).view(1, 1, -1)
+    std = torch.as_tensor(std, dtype=torch.float32).view(1, 1, -1)
+    return (tensor - mean) / (std + 1e-8)
+
+
+# Feature columns that represent returns/momentum (market-correlated).
+RELATIVE_STRENGTH_FEATURES = ['return_1d', 'return_5d', 'return_20d', 'mom_5d', 'mom_20d']
+
+
+def market_neutralize(
+    tensor: torch.Tensor,
+    feature_names: list,
+    neutral_features: list = None
+) -> torch.Tensor:
+    """
+    Zero-center cross-sectionally (across the N stocks at each timestep) the
+    return/momentum features, so the model learns RELATIVE strength vs the
+    market/peer group instead of the absolute market direction.
+
+    Market direction is the dominant, non-informative signal in cross-sectional
+    equity prediction; removing the cross-sectional mean per feature per day
+    forces the model to focus on stock-specific (alpha) patterns.
+
+    Args:
+        tensor: [T, N, F]
+        feature_names: order of feature columns matching tensor dims
+        neutral_features: subset of feature columns to demean; defaults to the
+                          return/momentum columns.
+
+    Returns:
+        New tensor with selected features demeaned across the N axis.
+    """
+    if neutral_features is None:
+        neutral_features = RELATIVE_STRENGTH_FEATURES
+    idx = [i for i, name in enumerate(feature_names) if name in neutral_features]
+    if not idx:
+        return tensor
+    result = tensor.clone()
+    group = result[:, :, idx]                      # [T, N, K]
+    result[:, :, idx] = group - group.mean(dim=1, keepdim=True)
+    return result
+
+
+def apply_preprocessing(
+    tensor: torch.Tensor,
+    feature_names: list,
+    mean=None,
+    std=None,
+    market_neutralized: bool = False,
+    neutral_features: list = None
+) -> torch.Tensor:
+    """
+    Apply the exact inference-time preprocessing used at training:
+      1. market_neutralize (cross-sectional demean of return features) if enabled
+      2. z-score normalization with saved stats
+
+    Args:
+        tensor: [T, N, F]
+        feature_names: column order
+        mean/std: saved z-score stats
+        market_neutralized: whether training demeaned cross-sectionally
+        neutral_features: which columns to demean (default return/momentum)
+
+    Returns:
+        Preprocessed tensor
+    """
+    if market_neutralized:
+        tensor = market_neutralize(tensor, feature_names, neutral_features)
+    return apply_normalization(tensor, mean, std)
 
 
 # ===================
