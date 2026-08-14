@@ -1,0 +1,90 @@
+# CausalFolio Configuration
+# ==========================
+# Using 10 test stocks for initial development
+
+# ===================
+# Data Settings
+# ===================
+data:
+  market: "BSE"
+  train_start: "2018-01-01"
+  train_end: "2023-12-31"
+  
+  # Feature windows (days)
+  windows:
+    short: 5
+    medium: 20
+    long: 60
+  
+  # Graph settings
+  correlation_threshold: 0.4
+  update_graph_frequency: "monthly"
+
+# ===================
+# Universe Definition
+# ===================
+universe:
+  index: "NIFTY_500"     # Options: NIFTY_50, NIFTY_100, NIFTY_500
+  exchange_suffix: ".BO" # Use .BO for BSE, .NS for NSE
+
+# ===================
+# API Limits & Safety
+# ===================
+api_limits:
+  yfinance_batch_size: 50
+  yfinance_delay_seconds: 2
+  yfinance_max_retries: 3
+
+# ===================
+# Model Settings
+# ===================
+model:
+  # GNN
+  gnn_hidden_dim: 128
+  gnn_num_layers: 3
+  gnn_heads: 4
+  gnn_dropout: 0.3
+  
+  # TCN
+  tcn_hidden_dim: 256
+  tcn_num_layers: 7
+  tcn_kernel_size: 3
+  tcn_dropout: 0.3
+  
+  # Blackwell (Model A)
+  num_regimes: 3
+
+# ===================
+# Training Settings
+# ===================
+training:
+  seed: 42 
+  # Initial training
+  initial_epochs: 100
+  initial_lr: 0.001
+  batch_size: 32
+  
+  # Daily fine-tuning
+  finetune_epochs: 3
+  finetune_lr: 0.0001
+  
+  # Regularization
+  weight_decay: 0.01
+  early_stopping_patience: 10
+
+# ===================
+# Paths (for Colab + Google Drive)
+# ===================
+paths:
+  checkpoint_dir: "checkpoints/"
+  logs_dir: "logs/"
+  data_cache: "data_cache/"
+
+# ===================
+# News scraping
+# ===================
+news:
+  sources:
+    - "economic_times"
+    - "yahoo_finance"
+  delay_seconds: 2

@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Node
+node_modules/
+web_frontend/dist/
+web_frontend/dist-ssr/
+
+# Model checkpoints & binary data
+checkpoints/
+pastmodels/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.zip
+
+# Logs & cache
+logs/
+data_cache/
+*.log
+
+# Environment variables
+.env
+.env.*
+.env.local
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
