@@ -105,11 +105,37 @@ def get_prices(
                     group_by='ticker',
                     auto_adjust=False
                 )
+                
+                # Check if any ticker has all NaNs, try .NS fallback
+                for tk in batch_tickers:
+                    has_data = False
+                    if isinstance(batch_data.columns, pd.MultiIndex):
+                        if tk in batch_data.columns.levels[0] and len(batch_data[tk].dropna()) > 10:
+                            has_data = True
+                        elif tk in batch_data.columns.levels[1] and len(batch_data.xs(tk, level=1, axis=1).dropna()) > 10:
+                            has_data = True
+                    elif len(batch_data.dropna()) > 10:
+                        has_data = True
+                        
+                    if not has_data and tk.endswith('.BO'):
+                        ns_tk = tk.replace('.BO', '.NS')
+                        try:
+                            ns_data = yf.download(ns_tk, start=start, end=end, progress=False, auto_adjust=False)
+                            if len(ns_data.dropna()) > 10:
+                                if len(batch_tickers) == 1:
+                                    batch_data = ns_data
+                                else:
+                                    # Rename columns to .BO
+                                    ns_data.columns = pd.MultiIndex.from_product([[tk], ns_data.columns])
+                                    batch_data = pd.concat([batch_data, ns_data], axis=1)
+                        except Exception:
+                            pass
+                            
                 all_data.append(batch_data)
                 break # Success
             except Exception as e:
                 print(f"  Attempt {attempt+1} failed: {e}")
-                time.sleep(delay_seconds * (attempt + 1)) # Exponential backoff
+                time.sleep(delay_seconds * (attempt + 1))
         
         # Delay between batches to prevent rate limits
         if i + batch_size < len(tickers):

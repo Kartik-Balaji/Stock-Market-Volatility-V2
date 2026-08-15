@@ -6,8 +6,15 @@ Predicts the 5-day return direction and bounds using the v3 classification model
 
 import os
 import sys
-from datetime import datetime, timedelta
 from pathlib import Path
+
+# Fix Windows console UTF-8 encoding
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -262,17 +269,19 @@ def get_predictions(tickers, sectors, data):
     with torch.no_grad():
         outputs = model(tensor.to(device), edge_index.to(device), sentiment.to(device))
         vol = outputs['volatility'][-1].cpu().numpy().flatten()
-        direction_logits = outputs['direction'][-1].cpu()
-        direction_classes = torch.argmax(direction_logits, dim=-1).numpy()
+        if 'returns' in outputs:
+            ret_preds = outputs['returns'][-1].cpu().numpy().flatten()
+        else:
+            ret_preds = outputs['direction'][-1].cpu().numpy().flatten()
 
-    return valid_tickers, vol, direction_classes, sentiment_scores
+    return valid_tickers, vol, ret_preds, sentiment_scores
 
-def predict_prices(tickers, indicators, vol, dir_classes, sentiment, target_ticker=None):
+def predict_prices(tickers, indicators, vol, ret_preds, sentiment, target_ticker=None):
     print("\n" + "=" * 60)
     if target_ticker:
-        print(f"Step 4: Price Predictions (Calibrated with v3 Model) for {target_ticker}")
+        print(f"Step 4: Price Predictions (Calibrated Model) for {target_ticker}")
     else:
-        print("Step 4: Price Predictions (Calibrated with v3 Model)")
+        print("Step 4: Price Predictions (Calibrated Model)")
     print("=" * 60)
     
     predictions = []
@@ -283,33 +292,34 @@ def predict_prices(tickers, indicators, vol, dir_classes, sentiment, target_tick
         if ticker not in indicators: continue
         
         ind = indicators[ticker]
-        v = vol[i]
-        s = sentiment.get(ticker, 0.0)
-        c = dir_classes[i]
+        v = float(vol[i])
+        s = float(sentiment.get(ticker, 0.0))
+        raw_ret = float(ret_preds[i])
         
-        current = ind['current_price']
+        current = float(ind['current_price'])
         
-        # DOWN=0, SIDEWAYS=1, UP=2 (calibrated threshold is 2%)
-        base_expected = {0: -2.5, 1: 0.0, 2: 2.5}[c]
+        # Predicted return from model (convert to %)
+        model_move_pct = raw_ret * 100.0
         
-        # Combine with momentum & sentiment
-        expected_move_pct = base_expected + (s * 5) + (ind['momentum_5d'] * 0.1)
-        expected_move_pct = max(-15, min(15, expected_move_pct))
+        # Combine model expected return with momentum & sentiment
+        expected_move_pct = model_move_pct + (s * 3.0) + (ind['momentum_5d'] * 0.05)
+        expected_move_pct = max(-15.0, min(15.0, expected_move_pct))
         
-        target = current * (1 + expected_move_pct / 100)
+        target = current * (1.0 + expected_move_pct / 100.0)
         
-        dir_str = "🟢 UP" if expected_move_pct > 1.0 else "🔴 DOWN" if expected_move_pct < -1.0 else "🟡 SIDEWAYS"
+        dir_str = "🟢 UP" if expected_move_pct > 0.5 else "🔴 DOWN" if expected_move_pct < -0.5 else "🟡 SIDEWAYS"
         
-        confidence = 40 + (abs(expected_move_pct) * 3) + ((1 - min(v, 0.4)) * 20)
-        confidence = min(confidence, 90)
-        if base_expected > 0 and ind['trend_signal'] == "BULLISH": confidence += 5
+        confidence = 50.0 + (abs(expected_move_pct) * 4.0) + ((1.0 - min(v, 0.4)) * 25.0)
+        confidence = min(confidence, 92.0)
+        if expected_move_pct > 0 and ind['trend_signal'] == "BULLISH": confidence += 4.0
+        if expected_move_pct < 0 and ind['trend_signal'] == "BEARISH": confidence += 4.0
         
         five_day_vol = v / 7.0
         
         predictions.append({
             'Ticker': ticker, 'Current_Price': current, 'Direction': dir_str,
             'Target_Price': target, 'Expected_Move': expected_move_pct,
-            'Support': current * (1 - five_day_vol), 'Resistance': current * (1 + five_day_vol),
+            'Support': current * (1.0 - five_day_vol), 'Resistance': current * (1.0 + five_day_vol),
             'Volatility': v, 'Confidence': confidence
         })
         

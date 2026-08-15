@@ -10,6 +10,15 @@ Usage (in Colab):
     tensor = features_to_tensor(features_dict, tickers)  # For GNN input
 """
 
+import sys
+if sys.platform == 'win32' and hasattr(sys.stdout, 'buffer'):
+    import io
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Tuple
@@ -255,16 +264,29 @@ def build_multi_stock_features(
         try:
             # Handle different yfinance column structures
             if isinstance(data.columns, pd.MultiIndex):
-                # Check if tickers are at level 0 or level 1
-                level_0 = data.columns.get_level_values(0).unique()
-                level_1 = data.columns.get_level_values(1).unique()
+                level_0 = [str(x) for x in data.columns.get_level_values(0).unique()]
+                level_1 = [str(x) for x in data.columns.get_level_values(1).unique()]
                 
-                if ticker in level_0:
-                    # Old structure: (Ticker, Price)
-                    stock_data = data[ticker]
-                elif ticker in level_1:
-                    # New structure: (Price, Ticker) - swap levels
-                    stock_data = data.xs(ticker, level=1, axis=1)
+                alt_ticker = ticker.replace('.BO', '.NS') if ticker.endswith('.BO') else ticker.replace('.NS', '.BO')
+                base_symbol = ticker.split('.')[0]
+                
+                matched_col = None
+                is_level_0 = False
+                for candidate in [ticker, alt_ticker, base_symbol]:
+                    if candidate in level_0:
+                        matched_col = candidate
+                        is_level_0 = True
+                        break
+                    elif candidate in level_1:
+                        matched_col = candidate
+                        is_level_0 = False
+                        break
+                        
+                if matched_col is not None:
+                    if is_level_0:
+                        stock_data = data[matched_col]
+                    else:
+                        stock_data = data.xs(matched_col, level=1, axis=1)
                 else:
                     print(f"  ✗ {ticker}: Not found in data")
                     continue
@@ -287,7 +309,7 @@ def features_to_tensor(
 ) -> Tuple[torch.Tensor, List[str], pd.DatetimeIndex]:
     """
     Convert feature dictionaries to tensor for GNN.
-    Uses forward-fill for missing values, then skips any remaining NaN rows.
+    Uses forward-fill for missing feature values, excluding any forward-return targets.
     
     Args:
         features_dict: Dict mapping ticker -> feature DataFrame
@@ -307,14 +329,36 @@ def features_to_tensor(
     
     print(f"  → Using {len(valid_tickers)} stocks")
     
-    # Forward-fill NaN in each stock's features
-    for ticker in valid_tickers:
-        features_dict[ticker] = features_dict[ticker].ffill().bfill()
+    # Identify non-target feature columns
+    sample_df = features_dict[valid_tickers[0]]
+    feature_names = [c for c in sample_df.columns if not c.startswith('forward_return')]
     
-    # Find common dates across all valid tickers
+    # Get max available dates across any stock to determine full dataset span
+    all_dates = set()
+    for t in valid_tickers:
+        all_dates.update(features_dict[t].index)
+    max_days = len(all_dates)
+    min_required_days = max(50, int(max_days * 0.75))
+    
+    # Filter tickers with sufficient history
+    mature_tickers = []
+    for t in valid_tickers:
+        valid_rows = len(features_dict[t].dropna(subset=feature_names[:3]))
+        if valid_rows >= min_required_days:
+            mature_tickers.append(t)
+    
+    if not mature_tickers:
+        mature_tickers = valid_tickers
+        
+    print(f"  → Retained {len(mature_tickers)}/{len(valid_tickers)} stocks with >=75% history")
+    
+    # Find common dates across mature tickers
     common_dates = None
-    for ticker in valid_tickers:
-        dates = set(features_dict[ticker].index)
+    cleaned_dict = {}
+    for ticker in mature_tickers:
+        df_feat = features_dict[ticker][feature_names].copy().ffill().bfill().fillna(0.0)
+        cleaned_dict[ticker] = df_feat
+        dates = set(df_feat.index)
         if common_dates is None:
             common_dates = dates
         else:
@@ -322,18 +366,15 @@ def features_to_tensor(
     
     common_dates = sorted(common_dates)
     
-    # Get feature names
-    feature_names = list(features_dict[valid_tickers[0]].columns)
-    
     # Build tensor [T x N x F]
     T = len(common_dates)
-    N = len(valid_tickers)
+    N = len(mature_tickers)
     F = len(feature_names)
     
     tensor = torch.zeros(T, N, F)
     
-    for i, ticker in enumerate(valid_tickers):
-        df = features_dict[ticker].loc[common_dates, feature_names]
+    for i, ticker in enumerate(mature_tickers):
+        df = cleaned_dict[ticker].loc[common_dates, feature_names]
         tensor[:, i, :] = torch.tensor(df.values, dtype=torch.float32)
     
     # Check for any remaining NaN
@@ -344,7 +385,7 @@ def features_to_tensor(
     
     print(f"  ✓ Tensor: {tensor.shape} [T={T} days, N={N} stocks, F={F} features]")
     
-    return tensor, feature_names, pd.DatetimeIndex(common_dates)
+    return tensor, feature_names, pd.DatetimeIndex(common_dates), mature_tickers
 
 
 def normalize_features(tensor: torch.Tensor) -> Tuple[torch.Tensor, Dict]:

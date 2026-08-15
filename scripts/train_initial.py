@@ -1,50 +1,40 @@
 """
 CausalFolio - Initial Training Script
 ======================================
-Trains the model on 5 years of historical BSE data.
+Trains the model on multi-year historical BSE/NSE data using continuous
+return regression and realized volatility prediction.
 
-Run this ONCE to create the base model, then use daily_update.py
-for ongoing fine-tuning.
-
-Usage (in Colab):
-    !python train_initial.py
-
-Or run cells from this file in a notebook.
+Usage:
+    python scripts/train_initial.py --universe NIFTY_100 --start-date 2018-01-01
 """
 
 import os
 import sys
+from pathlib import Path
+
+# Fix Windows console UTF-8 encoding
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 import torch
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-from tqdm import tqdm
-
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
-
-# ============================================================
-# Configuration
-# ============================================================
-
 import yaml
-
-# ============================================================
-# Configuration - Load from config.yaml
-# ============================================================
-
-from pathlib import Path
+from sklearn.metrics import classification_report, mean_absolute_error
 
 def get_base_dir():
-    """Robustly get the base project directory, handling Colab exec()."""
+    """Robustly get the base project directory."""
     try:
         return Path(__file__).parent.parent
     except NameError:
-        colab_path = Path('/content/drive/MyDrive/BSEpredictionNew')
-        if colab_path.exists():
-            return colab_path
-        # Fallback when running via exec() in Colab where __file__ is not defined.
-        # This assumes you have changed your current working directory to the project root.
         return Path.cwd()
+
+_base_dir = get_base_dir()
+if str(_base_dir) not in sys.path:
+    sys.path.insert(0, str(_base_dir))
 
 def load_config(config_path=None):
     """Load configuration from YAML file."""
@@ -54,43 +44,29 @@ def load_config(config_path=None):
         config = yaml.safe_load(f)
     return config
 
-# Ensure base project dir is importable (data/, features/, models/, config/)
-_base_dir = get_base_dir()
-if str(_base_dir) not in sys.path:
-    sys.path.insert(0, str(_base_dir))
-
-# Training-specific settings (can override config.yaml)
+# Training-specific defaults
 TRAINING_CONFIG = {
-    # Model settings (INTENSIVE)
-    'gnn_hidden': 64,
-    'gnn_output': 32,
-    'tcn_hidden': 128,
-    'tcn_layers': 7,       # Receptive field: 63 days
-    'dropout': 0.2,
+    'gnn_hidden': 128,
+    'gnn_output': 64,
+    'tcn_hidden': 256,
+    'tcn_layers': 5,
+    'dropout': 0.3,
     
-    # Training settings (INTENSIVE)
-    'epochs': 300,
-    'batch_size': 16, # Reduced from 64 to prevent OOM with large receptive fields & 500 stocks
+    'epochs': 150,
+    'batch_size': 32,
     'learning_rate': 0.0005,
     'weight_decay': 1e-4,
     'val_split': 0.15,
-    'early_stopping': 50,
+    'early_stopping': 30,
     
-    # Learning rate scheduling
-    'lr_patience': 15,
+    'lr_patience': 10,
     'lr_factor': 0.5,
 }
 
-# ============================================================
-# Stock Loading from config.yaml
-# ============================================================
-
 def load_stocks_from_config(config_path=None):
-    """
-    Load stocks and sectors dynamically from universe_loader.
-    """
+    """Load stocks and sectors dynamically from universe_loader."""
     print("\n" + "=" * 60)
-    print("Step 1: Loading Stocks from universe_loader")
+    print("Step 1: Loading Universe Constituents")
     print("=" * 60)
     
     from data.universe_loader import get_universe_tickers, get_sector_mapping
@@ -99,440 +75,247 @@ def load_stocks_from_config(config_path=None):
     tickers = get_universe_tickers(config)
     sectors = get_sector_mapping(config)
     
-    print(f"✓ Loaded {len(tickers)} stocks for universe: {config.get('universe', {}).get('index', 'Unknown')}")
-    
+    print(f"✓ Loaded {len(tickers)} stocks for index: {config.get('universe', {}).get('index', 'Unknown')}")
     return tickers, sectors
-
-
-# ============================================================
-# Setup
-# ============================================================
 
 def setup_paths(checkpoint_dir):
     """Ensure all required paths exist."""
     os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    # Add ml folder to path
-    ml_path = str(get_base_dir().absolute())
-    if ml_path not in sys.path:
-        sys.path.insert(0, ml_path)
-    
-    print(f"✓ Checkpoint directory: {checkpoint_dir}")
-
-# ============================================================
-# Data Loading
-# ============================================================
+    print(f"✓ Checkpoint directory ready: {checkpoint_dir}")
 
 def load_data(tickers, start_date, end_date):
-    """Load historical data for given tickers using batched bse_loader."""
+    """Load historical OHLCV data using batched bse_loader."""
     from data.bse_loader import get_prices
     
     print("\n" + "=" * 60)
-    print("Step 2: Loading Historical Data")
+    print("Step 2: Loading Historical Price Data")
     print("=" * 60)
-    
     print(f"Tickers to fetch: {len(tickers)}")
     print(f"Date range: {start_date} to {end_date}")
     
-    # Download data using our batched loader to prevent Rate Limits
     data = get_prices(
         tickers,
         start=start_date,
         end=end_date,
         progress=True
     )
-    
     print(f"✓ Downloaded shape: {data.shape}")
     return data
 
-# ============================================================
-# Feature Engineering
-# ============================================================
-
-def compute_features(data):
-    """Compute classical features for all stocks."""
-    import importlib
-    import features.classical
-    importlib.reload(features.classical)
-    import features.graph_builder
-    importlib.reload(features.graph_builder)
+def compute_features(data, tickers, sectors):
+    """Compute classical technical features and build graph structure."""
     from features.classical import build_multi_stock_features, features_to_tensor
     from features.graph_builder import build_graph
     
     print("\n" + "=" * 60)
-    print("Step 2: Computing Features")
+    print("Step 3: Feature Engineering & Graph Construction")
     print("=" * 60)
     
-    # Build features WITH forward returns so we can compute correct target labels.
-    # The model input tensor uses only the non-forward columns (10 features).
-    features_dict = build_multi_stock_features(data, CONFIG['tickers'], include_forward_returns=True)
+    # Compute features with forward returns
+    features_dict = build_multi_stock_features(data, tickers, include_forward_returns=True)
+    valid_tickers = [t for t in tickers if t in features_dict and len(features_dict[t]) > 0]
     
-    for ticker in CONFIG['tickers']:
-        if ticker in features_dict:
-            print(f"  ✓ {ticker}: {len(features_dict[ticker])} days, "
-                  f"{len(features_dict[ticker].columns)} features")
+    # Convert clean input features to tensor
+    tensor, feature_names, dates, valid_tickers = features_to_tensor(features_dict, valid_tickers)
     
-    # Strip forward-return columns before building the model input tensor
-    # (forward returns are TARGETS, not features).
-    first_ticker = next(iter(features_dict))
-    model_feature_cols = [c for c in features_dict[first_ticker].columns
-                          if not c.startswith('forward_return')]
-    model_features = {t: df[model_feature_cols] for t, df in features_dict.items()}
-    
-    # Convert to tensor
-    tensor, feature_names, dates = features_to_tensor(model_features, CONFIG['tickers'])
-    print(f"\n✓ Feature tensor: {tensor.shape}")
-    print(f"  Features: {feature_names}")
-    
-    # Build graph with max edges limit to avoid OOM for 500 stocks
-    edge_index, edge_info = build_graph(
-        model_features, 
-        CONFIG['tickers'], 
-        CONFIG['sectors'],
+    # Build graph with sector + correlation edges
+    edge_index, _ = build_graph(
+        features_dict, 
+        valid_tickers, 
+        sectors,
         corr_threshold=0.3,
-        max_edges_per_node=10
+        max_edges_per_node=5
     )
+    
+    print(f"✓ Feature tensor: {tensor.shape} (T={tensor.shape[0]} days, N={tensor.shape[1]} stocks, F={tensor.shape[2]} features)")
     print(f"✓ Graph edges: {edge_index.shape[1]}")
     
-    return tensor, feature_names, dates, edge_index, features_dict
+    return tensor, feature_names, dates, edge_index, features_dict, valid_tickers
 
-# ============================================================
-# Sentiment (Optional - for historical data, we use neutral)
-# ============================================================
-
-def get_sentiment_scores():
+def compute_targets(features_dict, valid_tickers, dates, horizon=5):
     """
-    Get sentiment scores for each stock.
+    Compute continuous targets:
+    1. vol_5d: 5-day realized volatility [T, N, 1]
+    2. forward_return_5d: 5-day cumulative forward return [T, N, 1]
     
-    For historical training, we use neutral (0.0) since we don't have
-    historical news. Daily updates will include real sentiment.
+    Drops the trailing `horizon` rows where forward returns cannot be observed.
     """
     print("\n" + "=" * 60)
-    print("Step 3: Sentiment Scores")
+    print("Step 4: Computing Continuous Targets (Volatility & Returns)")
     print("=" * 60)
     
-    # For initial training, use neutral sentiment
-    # Daily updates will incorporate real FinBERT scores
-    sentiment = torch.zeros(len(CONFIG['tickers']))
+    vol_targets_list = []
+    ret_targets_list = []
     
-    print("  ℹ Using neutral sentiment for historical training")
-    print("  (Real sentiment will be used in daily updates)")
+    dates = pd.DatetimeIndex(dates)
     
-    return sentiment
+    for ticker in valid_tickers:
+        df = features_dict[ticker].reindex(dates)
+        
+        # Volatility target
+        if 'vol_5d' in df.columns:
+            vol_targets_list.append(df['vol_5d'].values)
+        else:
+            vol_targets_list.append(np.zeros(len(df)))
+            
+        # Continuous Forward Return target
+        if 'forward_return_5d' in df.columns:
+            ret_targets_list.append(df['forward_return_5d'].values)
+        else:
+            # Fallback compute from Close
+            if 'Close' in df.columns:
+                f_ret = (df['Close'].shift(-horizon) - df['Close']) / df['Close']
+                ret_targets_list.append(f_ret.values)
+            else:
+                ret_targets_list.append(np.zeros(len(df)))
+    
+    vol_targets = np.stack(vol_targets_list, axis=1)  # [T, N]
+    ret_targets = np.stack(ret_targets_list, axis=1)  # [T, N]
+    
+    # Trim the trailing unclosed forward window (last 5 rows)
+    if len(dates) > horizon:
+        vol_targets = vol_targets[:-horizon]
+        ret_targets = ret_targets[:-horizon]
+        valid_dates = dates[:-horizon]
+    else:
+        valid_dates = dates
+    
+    vol_targets_tensor = torch.tensor(np.nan_to_num(vol_targets, 0.0), dtype=torch.float32).unsqueeze(-1)
+    ret_targets_tensor = torch.tensor(np.nan_to_num(ret_targets, 0.0), dtype=torch.float32).unsqueeze(-1)
+    
+    # Diagnostic stats on return target distribution
+    ret_flat = ret_targets.flatten()
+    up_count = (ret_flat > 0.005).sum()
+    down_count = (ret_flat < -0.005).sum()
+    flat_count = len(ret_flat) - up_count - down_count
+    
+    print(f"✓ Volatility targets: {vol_targets_tensor.shape}, mean={vol_targets_tensor.mean():.4f}")
+    print(f"✓ Return targets: {ret_targets_tensor.shape}, mean={ret_targets_tensor.mean():.4f}, std={ret_targets_tensor.std():.4f}")
+    print(f"  Distribution: UP(>+0.5%)={up_count} ({up_count/len(ret_flat)*100:.1f}%), "
+          f"DOWN(<-0.5%)={down_count} ({down_count/len(ret_flat)*100:.1f}%), "
+          f"FLAT={flat_count} ({flat_count/len(ret_flat)*100:.1f}%)")
+    
+    return vol_targets_tensor, ret_targets_tensor, valid_dates
 
-# ============================================================
-# Model Creation
-# ============================================================
-
-def create_model():
-    """Create the CausalFolioMinimal model."""
-    # Import model internally referring to relative structure
-    import importlib
-    import models.model_minimal
-    importlib.reload(models.model_minimal)
+def create_model(num_features, num_stocks, config):
+    """Instantiate CausalFolioMinimal and TrainingModule."""
     from models.model_minimal import CausalFolioMinimal, TrainingModule
     
-    # Create model
     model = CausalFolioMinimal(
-        num_features=CONFIG['num_features'],
-        num_stocks=len(CONFIG['tickers']),
-        gnn_hidden=CONFIG['gnn_hidden'],
-        gnn_output=CONFIG['gnn_output'],
-        tcn_hidden=CONFIG['tcn_hidden'],
-        tcn_layers=CONFIG['tcn_layers'],
-        dropout=CONFIG['dropout'],
+        num_features=num_features,
+        num_stocks=num_stocks,
+        gnn_hidden=config['gnn_hidden'],
+        gnn_output=config['gnn_output'],
+        tcn_hidden=config['tcn_hidden'],
+        tcn_layers=config['tcn_layers'],
+        dropout=config['dropout'],
         use_sentiment=True
     )
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    print(f"✓ Model created")
+    print(f"\n✓ Model initialized on {device.upper()}")
     print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"  Device: {device}")
-    print(f"  Receptive field: {model.get_receptive_field()} days")
+    print(f"  TCN Receptive field: {model.get_receptive_field()} trading days")
     
-    # Create trainer
     trainer = TrainingModule(
         model,
-        learning_rate=CONFIG['learning_rate'],
-        weight_decay=CONFIG['weight_decay'],
+        learning_rate=config['learning_rate'],
+        weight_decay=config['weight_decay'],
         device=device
     )
     
     return model, trainer, device
 
-# ============================================================
-# Target Computation
-# ============================================================
-
-# Direction class labels
-DIRECTION_DOWN = 0
-DIRECTION_SIDEWAYS = 1
-DIRECTION_UP = 2
-DIRECTION_THRESHOLD = 0.02  # ±2% threshold
-
-def compute_targets(features_dict, dates):
-    """
-    Compute DUAL training targets (volatility AND direction CLASS LABELS).
-    
-    Targets:
-    1. vol_5d: 5-day realized volatility [T, N, 1]
-    2. direction_labels: 0=DOWN, 1=SIDEWAYS, 2=UP [T, N]
-    
-    Direction thresholds (applied to the TRUE forward return):
-    - DOWN: return < -2%
-    - SIDEWAYS: -2% <= return <= +2%
-    - UP: return > +2%
-    
-    The forward return used is the actual 5-day cumulative return
-    (close[t+5]/close[t] - 1), extracted from the forward_return_5d column
-    that features_dict now contains (see compute_features).
-    """
+def evaluate_predictions(model, features, edge_index, sentiment, vol_targets, ret_targets):
+    """Comprehensive post-training evaluation across multiple directional thresholds."""
     print("\n" + "=" * 60)
-    print("Step 5: Computing Targets (Classification)")
-    print("=" * 60)
-    
-    vol_targets_list = []
-    ret_values_list = []
-    
-    # Align every target to the same date axis used for the feature tensor
-    if dates is not None:
-        dates = pd.DatetimeIndex(dates)
-    
-    for ticker in CONFIG['tickers']:
-        if ticker in features_dict:
-            df = features_dict[ticker]
-            
-            if dates is not None and len(df.index) != len(dates):
-                # Intersect with the tensor's common dates (keep same order)
-                df = df.reindex(dates)
-            
-            # Volatility target
-            if 'vol_5d' in df.columns:
-                vol_targets_list.append(df['vol_5d'].values)
-            else:
-                print(f"  ⚠ {ticker}: Missing vol_5d, using zeros")
-                vol_targets_list.append(np.zeros(len(df)))
-            
-            # True forward return (5-day cumulative) - present in features_dict
-            if 'forward_return_5d' in df.columns:
-                ret_values_list.append(df['forward_return_5d'].values)
-            else:
-                # Fallback: attempt to approximate from 1-day returns is WRONG;
-                # compute the real 5-day cumulative forward return when possible.
-                if 'return_1d' in df.columns:
-                    # Approximate cumulative forward return from 1d log returns
-                    # sum of the next 5 log returns ~ ln(close[t+5]/close[t])
-                    r1 = df['return_1d']
-                    approx = np.zeros(len(df))
-                    for i in range(1, 6):
-                        si = r1.shift(-i).values
-                        approx += np.nan_to_num(si)
-                    ret_values_list.append(approx)
-                else:
-                    print(f"  ⚠ {ticker}: Missing forward_return_5d, using zeros")
-                    ret_values_list.append(np.zeros(len(df)))
-    
-    # Stack arrays
-    vol_targets = np.stack(vol_targets_list, axis=1)  # [T, N]
-    ret_values = np.stack(ret_values_list, axis=1)    # [T, N]
-    
-    # Convert returns to class labels
-    # DOWN=0: return < -THRESHOLD
-    # SIDEWAYS=1: -THRESHOLD <= return <= +THRESHOLD
-    # UP=2: return > +THRESHOLD
-    direction_labels = np.ones_like(ret_values, dtype=np.int64) * DIRECTION_SIDEWAYS  # Default SIDEWAYS
-    direction_labels[ret_values < -DIRECTION_THRESHOLD] = DIRECTION_DOWN
-    direction_labels[ret_values > DIRECTION_THRESHOLD] = DIRECTION_UP
-    
-    # Create tensors
-    vol_targets_tensor = torch.tensor(vol_targets, dtype=torch.float32).unsqueeze(-1)  # [T, N, 1]
-    direction_labels_tensor = torch.tensor(direction_labels, dtype=torch.long)  # [T, N]
-    
-    # Handle any NaN values
-    vol_targets_tensor = torch.nan_to_num(vol_targets_tensor, 0.0)
-    
-    # Count class distribution
-    num_down = (direction_labels == DIRECTION_DOWN).sum()
-    num_sideways = (direction_labels == DIRECTION_SIDEWAYS).sum()
-    num_up = (direction_labels == DIRECTION_UP).sum()
-    total = direction_labels.size
-    
-    print(f"✓ Volatility targets shape: {vol_targets_tensor.shape}")
-    print(f"✓ Direction labels shape: {direction_labels_tensor.shape}")
-    print(f"  Class distribution (using ±{DIRECTION_THRESHOLD*100:.0f}% threshold):")
-    print(f"    DOWN:     {num_down:,} ({100*num_down/total:.1f}%)")
-    print(f"    SIDEWAYS: {num_sideways:,} ({100*num_sideways/total:.1f}%)")
-    print(f"    UP:       {num_up:,} ({100*num_up/total:.1f}%)")
-    
-    # Calculate Class Weights
-    weights = np.zeros(3)
-    if num_down > 0: weights[DIRECTION_DOWN] = total / (3 * num_down)
-    if num_sideways > 0: weights[DIRECTION_SIDEWAYS] = total / (3 * num_sideways)
-    if num_up > 0: weights[DIRECTION_UP] = total / (3 * num_up)
-    
-    # Normalize weights so they sum to 3 (num_classes)
-    weight_sum = weights.sum()
-    if weight_sum > 0:
-        weights = weights * (3.0 / weight_sum)
-        
-    class_weights_tensor = torch.tensor(weights, dtype=torch.float32)
-    
-    print(f"\n  Computed Class Weights:")
-    print(f"    DOWN:     {weights[DIRECTION_DOWN]:.4f}")
-    print(f"    SIDEWAYS: {weights[DIRECTION_SIDEWAYS]:.4f}")
-    print(f"    UP:       {weights[DIRECTION_UP]:.4f}")
-    
-    return vol_targets_tensor, direction_labels_tensor, class_weights_tensor
-
-# ============================================================
-# Training
-# ============================================================
-
-def train_model(model, trainer, features, edge_index, vol_targets, direction_labels, sentiment, class_weights, device):
-    """Train the model with DUAL TARGETS (Classification)."""
-    print("\n" + "=" * 60)
-    print("Step 6: Training (Direction Classification)")
-    print("=" * 60)
-    
-    features = features.to(device)
-    edge_index = edge_index.to(device)
-    vol_targets = vol_targets.to(device)
-    direction_labels = direction_labels.to(device)
-    sentiment = sentiment.to(device)
-    
-    print(f"Training configuration:")
-    print(f"  Epochs: {CONFIG['epochs']}")
-    print(f"  Batch size: {CONFIG['batch_size']}")
-    print(f"  Learning rate: {CONFIG['learning_rate']}")
-    print(f"  Validation split: {CONFIG['val_split']}")
-    print(f"  Early stopping patience: {CONFIG['early_stopping']}")
-    print(f"  Targets: Volatility (MSE) + Direction (CrossEntropy)")
-    print()
-    
-    # Train with dual targets (classification)
-    history = trainer.train(
-        features=features,
-        edge_index=edge_index,
-        vol_targets=vol_targets,
-        direction_labels=direction_labels,
-        class_weights=class_weights,
-        sentiment=sentiment,
-        epochs=CONFIG['epochs'],
-        val_split=CONFIG['val_split'],
-        early_stopping=CONFIG['early_stopping'],
-        verbose=True
-    )
-    
-    print(f"\n✓ Training complete!")
-    print(f"  Best epoch: {history['best_epoch'] + 1}")
-    print(f"  Best val loss: {history['best_val_loss']:.6f}")
-    
-    print("\n" + "=" * 60)
-    print("Step 6a: Final Evaluation (Classification Report)")
+    print("Step 6: Evaluation & Directional Accuracy Breakdown")
     print("=" * 60)
     
     model.eval()
     with torch.no_grad():
         outputs = model(features, edge_index, sentiment)
-        dir_logits = outputs['direction'].cpu() # [T, N, 3]
+        pred_vol = outputs['volatility'].cpu().numpy().squeeze(-1)
+        pred_ret = outputs['returns'].cpu().numpy().squeeze(-1)
         
-        # Predict classes
-        pred_classes = torch.argmax(dir_logits, dim=-1).flatten().numpy()
-        true_classes = direction_labels.cpu().flatten().numpy()
-        
-        target_names = ['DOWN', 'SIDEWAYS', 'UP']
-        print(classification_report(true_classes, pred_classes, target_names=target_names, zero_division=0))
+    true_vol = vol_targets.cpu().numpy().squeeze(-1)
+    true_ret = ret_targets.cpu().numpy().squeeze(-1)
     
-    return history
+    # 1. Sign Accuracy (Sign of Return: Directional accuracy)
+    sign_correct = ((pred_ret > 0) == (true_ret > 0)).mean() * 100.0
+    
+    # 2. Confident moves (filter out near-zero noise)
+    for thr in [0.005, 0.01, 0.015, 0.02]:
+        mask = np.abs(pred_ret) > thr
+        if mask.sum() > 0:
+            conf_acc = ((pred_ret[mask] > 0) == (true_ret[mask] > 0)).mean() * 100.0
+            print(f"  Directional Accuracy (Conviction |pred| > {thr*100:.1f}%): {conf_acc:.2f}% (on {mask.sum()}/{mask.size} trades)")
+        else:
+            print(f"  Directional Accuracy (Conviction |pred| > {thr*100:.1f}%): N/A (no trades)")
+    
+    # 3. Overall Metrics
+    vol_mae = mean_absolute_error(true_vol.flatten(), pred_vol.flatten())
+    ret_mae = mean_absolute_error(true_ret.flatten(), pred_ret.flatten())
+    
+    print(f"\n  Overall Directional Sign Accuracy (All samples): {sign_correct:.2f}%")
+    print(f"  Volatility MAE: {vol_mae:.4f}")
+    print(f"  Return MAE: {ret_mae*100:.2f}%")
+    
+    # 4. 3-Class Binned Representation for comparison
+    thr_3c = 0.02
+    pred_3c = np.where(pred_ret > thr_3c, 2, np.where(pred_ret < -thr_3c, 0, 1))
+    true_3c = np.where(true_ret > thr_3c, 2, np.where(true_ret < -thr_3c, 0, 1))
+    acc_3c = (pred_3c == true_3c).mean() * 100.0
+    baseline_3c = (true_3c == 1).mean() * 100.0
+    print(f"  3-Class Exact Bin Match (±{thr_3c*100:.0f}%): {acc_3c:.1f}% vs Sideways Baseline {baseline_3c:.1f}%")
 
-# ============================================================
-# Save Model
-# ============================================================
-
-def save_model(trainer):
-    """Save the trained model."""
+def save_model(trainer, checkpoint_path, config, feature_names, norm_stats, valid_tickers):
+    """Save model checkpoint with full normalization metadata."""
     print("\n" + "=" * 60)
-    print("Step 7: Saving Model")
+    print("Step 7: Saving Model Checkpoint")
     print("=" * 60)
     
-    checkpoint_path = os.path.join(CONFIG['checkpoint_dir'], CONFIG['model_name'])
-    # Embed feature normalization stats + feature names so inference can
-    # apply the exact same preprocessing.
     extra_config = {
-        'feature_mean': CONFIG.get('feature_mean'),
-        'feature_std': CONFIG.get('feature_std'),
-        'feature_names': CONFIG.get('feature_names'),
-        'market_neutralized': CONFIG.get('market_neutralized', False),
-        'num_stocks_train': len(CONFIG.get('tickers', [])),
+        'feature_mean': norm_stats['mean'].tolist(),
+        'feature_std': norm_stats['std'].tolist(),
+        'feature_names': feature_names,
+        'market_neutralized': True,
+        'num_stocks_train': len(valid_tickers),
+        'tickers': valid_tickers,
     }
     trainer.save_checkpoint(checkpoint_path, extra_config=extra_config)
-    
-    print(f"✓ Model saved to: {checkpoint_path}")
-    
-    return checkpoint_path
+    print(f"✓ Saved to {checkpoint_path}")
 
-def main(config_path=None, start_date='2019-01-01', end_date=None,
-         universe='NIFTY_100', max_tickers=None, epochs=None,
-         tcn_layers=None, model_name='causalfolio_v3.pt'):
+def main(
+    config_path=None,
+    start_date='2018-01-01',
+    end_date=None,
+    universe='NIFTY_100',
+    max_tickers=None,
+    epochs=None,
+    model_name='causalfolio_v3.pt'
+):
     """
-    Full training pipeline using dynamically fetched stocks.
-    
-    Args:
-        config_path: Path to config.yaml
-        start_date: Training start date (default: 2019-01-01)
-        end_date: Training end date (default: today)
-        universe: NIFTY_50, NIFTY_100, or NIFTY_500
-        max_tickers: Cap number of tickers (for fast local CPU runs)
-        epochs: Override epoch count
-        tcn_layers: Override TCN layers
-        model_name: Checkpoint file name
+    Main training execution pipeline.
     """
-    global CONFIG
-    
     if end_date is None:
         end_date = datetime.now().strftime('%Y-%m-%d')
         
-    # Colab Ghost Memory Fix: Purge previous traceback tensors from VRAM
-    import gc
-    import sys
-    sys.last_traceback = None
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
     print("=" * 60)
-    print("CausalFolio - Initial Training (INTENSIVE)")
+    print("CausalFolio - Scaled Model Training Pipeline")
     print("=" * 60)
-    print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Universe: {universe}, Period: {start_date} to {end_date}")
     
-    # Step 1: Load universe
-    tickers, sectors = load_stocks_from_config(config_path)
-    
-    # Optionally restrict universe for fast local CPU runs
-    if universe is not None and universe != 'NIFTY_500':
-        # Use the first N tickers from the loaded list (already ordered by index)
-        _univ_map = {'NIFTY_50': 50, 'NIFTY_100': 100}
-        n = _univ_map.get(universe, len(tickers))
-        tickers = tickers[:n]
-        sectors = {t: sectors[t] for t in tickers if t in sectors}
-    if max_tickers is not None and len(tickers) > max_tickers:
-        tickers = tickers[:max_tickers]
-        sectors = {t: sectors[t] for t in tickers if t in sectors}
-    print(f"  Universe restricted to: {len(tickers)} stocks")
-    
-    # Setup paths
     base_dir = get_base_dir()
     checkpoint_dir = str(base_dir / 'checkpoints')
+    setup_paths(checkpoint_dir)
     
-    # Overwrite config values from yaml
     yaml_config = load_config(config_path)
     model_cfg = yaml_config.get('model', {})
     
-    # Build CONFIG
-    CONFIG = {
-        'tickers': tickers,
-        'sectors': sectors,
+    config = {
         'start_date': start_date,
         'end_date': end_date,
         'num_features': 10,
@@ -541,95 +324,103 @@ def main(config_path=None, start_date='2019-01-01', end_date=None,
         'gnn_hidden': model_cfg.get('gnn_hidden_dim', TRAINING_CONFIG['gnn_hidden']),
         'gnn_output': model_cfg.get('gnn_hidden_dim', TRAINING_CONFIG['gnn_hidden']) // 2,
         'tcn_hidden': model_cfg.get('tcn_hidden_dim', TRAINING_CONFIG['tcn_hidden']),
-        'tcn_layers': tcn_layers if tcn_layers is not None else model_cfg.get('tcn_num_layers', TRAINING_CONFIG['tcn_layers']),
+        'tcn_layers': model_cfg.get('tcn_num_layers', TRAINING_CONFIG['tcn_layers']),
         'dropout': model_cfg.get('gnn_dropout', TRAINING_CONFIG['dropout']),
         **{k: v for k, v in TRAINING_CONFIG.items() if k not in ['gnn_hidden', 'gnn_output', 'tcn_hidden', 'tcn_layers', 'dropout']}
     }
     if epochs is not None:
-        CONFIG['epochs'] = epochs
+        config['epochs'] = epochs
     
-    print(f"\n→ Configuration:")
-    print(f"  Stocks: {len(CONFIG['tickers'])}")
-    print(f"  Date range: {CONFIG['start_date']} to {CONFIG['end_date']}")
-    print(f"  Intensive training: {CONFIG['epochs']} epochs")
+    # 1. Load universe tickers
+    tickers, sectors = load_stocks_from_config(config_path)
+    if universe == 'NIFTY_50':
+        tickers = tickers[:50]
+    elif universe == 'NIFTY_100':
+        tickers = tickers[:100]
+    if max_tickers is not None and len(tickers) > max_tickers:
+        tickers = tickers[:max_tickers]
+    sectors = {t: sectors.get(t, 'Unknown') for t in tickers}
+    print(f"  Training on {len(tickers)} stocks")
     
-    # Setup
-    setup_paths(checkpoint_dir)
-    
-    # Step 2: Load data
+    # 2. Download historical data
     data = load_data(tickers, start_date, end_date)
     
-    # Step 3: Compute features
-    features, feature_names, dates, edge_index, features_dict = compute_features(data)
-    CONFIG['feature_names'] = feature_names
+    # 3. Compute features & graph
+    features, feature_names, dates, edge_index, features_dict, valid_tickers = compute_features(data, tickers, sectors)
     
-    # Step 3b: Market-neutralize cross-sectional return features, then z-score
-    from features.classical import normalize_features, market_neutralize
+    # 4. Market-neutralize + Z-Score normalize features
+    from features.classical import market_neutralize, normalize_features
     features = market_neutralize(features, feature_names)
     features, norm_stats = normalize_features(features)
-    CONFIG['feature_mean'] = norm_stats['mean'].tolist()
-    CONFIG['feature_std'] = norm_stats['std'].tolist()
-    CONFIG['market_neutralized'] = True
-    print(f"\n✓ Features market-neutralized + z-scored, mean={norm_stats['mean'].shape}, std={norm_stats['std'].shape}")
+    print(f"\n✓ Features market-neutralized & normalized: mean={norm_stats['mean'].shape}, std={norm_stats['std'].shape}")
     
-    # Step 4: Get sentiment (neutral for historical)
-    sentiment = get_sentiment_scores()
+    # 5. Compute continuous targets (volatility + 5d forward returns)
+    vol_targets, ret_targets, valid_dates = compute_targets(features_dict, valid_tickers, dates, horizon=5)
     
-    # Step 5: Compute DUAL targets
-    vol_targets, ret_targets, class_weights = compute_targets(features_dict, dates)
+    # Align features with valid targets (dropping trailing unobservable horizon)
+    min_T = min(features.shape[0], vol_targets.shape[0], ret_targets.shape[0])
+    features = features[:min_T]
+    vol_targets = vol_targets[:min_T]
+    ret_targets = ret_targets[:min_T]
     
-    # Ensure shapes match
-    min_len = min(features.shape[0], vol_targets.shape[0], ret_targets.shape[0])
-    features = features[:min_len]
-    vol_targets = vol_targets[:min_len]
-    ret_targets = ret_targets[:min_len]
+    sentiment = torch.zeros(len(valid_tickers))
     
-    # Step 6: Create model
-    model, trainer, device = create_model()
+    # 6. Instantiate model & trainer
+    model, trainer, device = create_model(len(feature_names), len(valid_tickers), config)
     
-    # Step 7: Train with dual targets
-    history = train_model(model, trainer, features, edge_index, vol_targets, ret_targets, sentiment, class_weights, device)
+    # 7. Train model
+    print("\n" + "=" * 60)
+    print("Step 5: Training Dual Continuous Backbone")
+    print("=" * 60)
     
-    # Step 8: Save (with normalization stats embedded in checkpoint)
-    checkpoint_path = save_model(trainer)
+    features = features.to(device)
+    edge_index = edge_index.to(device)
+    vol_targets = vol_targets.to(device)
+    ret_targets = ret_targets.to(device)
+    sentiment = sentiment.to(device)
+    
+    history = trainer.train(
+        features=features,
+        edge_index=edge_index,
+        vol_targets=vol_targets,
+        ret_targets=ret_targets,
+        sentiment=sentiment,
+        epochs=config['epochs'],
+        val_split=config['val_split'],
+        early_stopping=config['early_stopping'],
+        verbose=True
+    )
+    
+    # 8. Detailed Evaluation
+    evaluate_predictions(model, features, edge_index, sentiment, vol_targets, ret_targets)
+    
+    # 9. Save Checkpoint
+    checkpoint_path = os.path.join(checkpoint_dir, model_name)
+    save_model(trainer, checkpoint_path, config, feature_names, norm_stats, valid_tickers)
     
     print("\n" + "=" * 60)
-    print("TRAINING COMPLETE")
+    print("ALL TRAINING & EVALUATION TASKS COMPLETED SUCCESSFULLY")
     print("=" * 60)
-    print(f"Finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Model saved to: {checkpoint_path}")
-    print(f"\nTrained on: {tickers}")
-    print("\nNext steps:")
-    print("  1. Run daily_update.py to fine-tune with new data")
-    print("  2. Use model for predictions")
-    
-    return model, trainer, history, CONFIG
-
-
-# Global CONFIG (will be populated by main())
-CONFIG = {}
+    return model, trainer, history
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="CausalFolio initial training")
-    parser.add_argument('--config', default=None, help='Path to config.yaml')
-    parser.add_argument('--start-date', default='2019-01-01', help='Training start date')
-    parser.add_argument('--end-date', default=None, help='Training end date (default: today)')
-    parser.add_argument('--universe', default='NIFTY_100', choices=['NIFTY_50', 'NIFTY_100', 'NIFTY_500'],
-                        help='Universe to use (default NIFTY_100 for local runs)')
-    parser.add_argument('--max-tickers', type=int, default=None, help='Cap number of tickers')
-    parser.add_argument('--epochs', type=int, default=None, help='Override epoch count')
-    parser.add_argument('--tcn-layers', type=int, default=None, help='Override TCN layers')
-    parser.add_argument('--model-name', default='causalfolio_v3.pt', help='Checkpoint file name')
+    parser = argparse.ArgumentParser(description="CausalFolio Scaled Training")
+    parser.add_argument('--config', default=None)
+    parser.add_argument('--start-date', default='2018-01-01')
+    parser.add_argument('--end-date', default=None)
+    parser.add_argument('--universe', default='NIFTY_100', choices=['NIFTY_50', 'NIFTY_100', 'NIFTY_500'])
+    parser.add_argument('--max-tickers', type=int, default=None)
+    parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--model-name', default='causalfolio_v3.pt')
     args = parser.parse_args()
     
-    model, trainer, history, config = main(
+    main(
         config_path=args.config,
         start_date=args.start_date,
         end_date=args.end_date,
         universe=args.universe,
         max_tickers=args.max_tickers,
         epochs=args.epochs,
-        tcn_layers=args.tcn_layers,
         model_name=args.model_name
     )

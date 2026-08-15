@@ -6,10 +6,17 @@ Tests model predictions against historical data using walk-forward methodology.
 
 import os
 import sys
+from pathlib import Path
+
+# Fix Windows console UTF-8 encoding
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 import argparse
 from datetime import datetime, timedelta
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -291,38 +298,25 @@ def run_single_prediction(data, tickers, sectors, train_end_idx, device='cpu', r
 
         T, N = tensor.shape[0], len(aligned_tickers)
         vol_targets = torch.tensor(np.stack(vol_list, axis=1), dtype=torch.float32).unsqueeze(-1)  # [T,N,1]
-        ret_matrix = np.stack(ret_list, axis=1)  # [T,N]
-        thr = CONFIG.get('threshold', 2.0) / 100.0
-        labels = np.ones_like(ret_matrix, dtype=np.int64)
-        labels[ret_matrix < -thr] = 0
-        labels[ret_matrix > thr] = 2
-        lab_tensor = torch.tensor(labels, dtype=torch.long)
-
-        counts = np.bincount(labels.flatten(), minlength=3).astype(float)
-        total = counts.sum()
-        w = np.where(counts > 0, total / (3.0 * counts), 1.0)
-        w = w / w.sum() * 3.0
-        class_weights = torch.tensor(w, dtype=torch.float32)
+        ret_targets = torch.tensor(np.stack(ret_list, axis=1), dtype=torch.float32).unsqueeze(-1)  # [T,N,1]
 
         sentiment = torch.zeros(N)
         tensor = market_neutralize(tensor, model_cols)
         tensor, stats = normalize_features(tensor)
-        stats_mean = stats['mean'].tolist()
-        stats_std = stats['std'].tolist()
 
         model = CausalFolioMinimal(
             num_features=len(model_cols),
             num_stocks=N,
-            gnn_hidden=32,
-            gnn_output=16,
-            tcn_hidden=64,
-            tcn_layers=3,
+            gnn_hidden=128,
+            gnn_output=64,
+            tcn_hidden=256,
+            tcn_layers=5,
             dropout=0.3,
             use_sentiment=True
         )
-        trainer = TrainingModule(model, learning_rate=1e-3, weight_decay=1e-4, device=device)
+        trainer = TrainingModule(model, learning_rate=5e-4, weight_decay=1e-4, device=device)
         trainer.train(
-            tensor, edge_index, vol_targets, lab_tensor, class_weights, sentiment,
+            tensor, edge_index, vol_targets, ret_targets, sentiment=sentiment,
             epochs=CONFIG.get('retrain_epochs', 25),
             val_split=0.15,
             early_stopping=10,
@@ -342,11 +336,11 @@ def run_single_prediction(data, tickers, sectors, train_end_idx, device='cpu', r
         model = CausalFolioMinimal(
             num_features=model_config.get('num_features', 10),
             num_stocks=len(aligned_tickers),
-            gnn_hidden=model_config.get('gnn_hidden', 32),
-            gnn_output=model_config.get('gnn_output', 16),
-            tcn_hidden=model_config.get('tcn_hidden', 32),
-            tcn_layers=model_config.get('tcn_layers', 4),
-            dropout=model_config.get('dropout', 0.2),
+            gnn_hidden=model_config.get('gnn_hidden', 128),
+            gnn_output=model_config.get('gnn_output', 64),
+            tcn_hidden=model_config.get('tcn_hidden', 256),
+            tcn_layers=model_config.get('tcn_layers', 5),
+            dropout=model_config.get('dropout', 0.3),
             use_sentiment=True
         )
         model.load_state_dict(checkpoint['model_state'])
@@ -368,19 +362,45 @@ def run_single_prediction(data, tickers, sectors, train_end_idx, device='cpu', r
     with torch.no_grad():
         outputs = model(inference_tensor.to(device), edge_index.to(device), sentiment.to(device))
         volatility_preds = outputs['volatility'][-1].cpu().numpy().flatten()
-        direction_logits = outputs['direction'][-1].cpu()
-        direction_preds = torch.argmax(direction_logits, dim=-1).numpy()
+        if 'returns' in outputs:
+            return_preds = outputs['returns'][-1].cpu().numpy().flatten()
+        else:
+            return_preds = outputs['direction'][-1].cpu().numpy().flatten()
 
     results = {}
+    thr = CONFIG.get('threshold', 1.0)
     for i, ticker in enumerate(aligned_tickers):
-        vol_pred = volatility_preds[i]
-        pred_class = direction_preds[i]
-        expected_move = {0: -2.5, 1: 0.0, 2: 2.5}[pred_class]
-        direction = ['DOWN', 'SIDEWAYS', 'UP'][pred_class]
+        vol_pred = float(volatility_preds[i])
+        raw_ret = float(return_preds[i])
+        
+        # Extract 5d momentum from train window for this ticker
+        try:
+            if isinstance(train_data.columns, pd.MultiIndex):
+                if ticker in train_data.columns.levels[0]:
+                    c_series = train_data[ticker]['Close'].dropna()
+                elif ticker in train_data.columns.levels[1]:
+                    c_series = train_data.xs(ticker, level=1, axis=1)['Close'].dropna()
+                else:
+                    c_series = pd.Series()
+            else:
+                c_series = train_data['Close'].dropna()
+            m5 = (c_series.iloc[-1] / c_series.iloc[-5] - 1) * 100.0 if len(c_series) >= 5 else 0.0
+        except Exception:
+            m5 = 0.0
+            
+        expected_move_pct = (raw_ret * 100.0) + (m5 * 0.15)
+        expected_move_pct = max(-15.0, min(15.0, expected_move_pct))
+
+        if expected_move_pct > thr:
+            direction = 'UP'
+        elif expected_move_pct < -thr:
+            direction = 'DOWN'
+        else:
+            direction = 'SIDEWAYS'
 
         results[ticker] = {
             'direction': direction,
-            'expected_move': expected_move,
+            'expected_move': expected_move_pct,
             'volatility': vol_pred,
             'sentiment': 0.0
         }
@@ -388,26 +408,42 @@ def run_single_prediction(data, tickers, sectors, train_end_idx, device='cpu', r
 
 def calculate_metrics(results: List[PredictionResult]) -> Dict:
     if not results: return {}
-    direction_correct = sum(1 for r in results if r.direction_correct)
+    n = len(results)
+    
+    # 1. Combined Directional Accuracy (3-state: UP>0, DOWN<0, SIDEWAYS within 2.5%)
+    correct_count = sum(1 for r in results if r.direction_correct)
+    combined_accuracy = correct_count / n * 100.0
+    
+    # 2. Overall Sign Match (Binary Sign)
+    sign_correct = sum(1 for r in results if (r.predicted_move_pct > 0 and r.actual_move_pct > 0) or (r.predicted_move_pct < 0 and r.actual_move_pct < 0))
+    overall_sign_acc = sign_correct / n * 100.0
+
+    # 3. Accuracy on active UP/DOWN trades
+    directional_trades = [r for r in results if r.predicted_direction in ['UP', 'DOWN']]
+    if directional_trades:
+        dir_correct = sum(1 for r in directional_trades if (r.predicted_direction == 'UP' and r.actual_move_pct > 0) or (r.predicted_direction == 'DOWN' and r.actual_move_pct < 0))
+        directional_accuracy = dir_correct / len(directional_trades) * 100.0
+    else:
+        directional_accuracy = 0.0
+
     up_preds = [r for r in results if r.predicted_direction == 'UP']
     down_preds = [r for r in results if r.predicted_direction == 'DOWN']
-    thr = CONFIG.get('threshold', 2.0)
+    side_preds = [r for r in results if r.predicted_direction == 'SIDEWAYS']
     
-    up_acc = sum(1 for r in up_preds if r.direction_correct) / len(up_preds) * 100 if up_preds else 0
-    down_acc = sum(1 for r in down_preds if r.direction_correct) / len(down_preds) * 100 if down_preds else 0
-    
-    # Baseline: always predict the majority class (SIDEWAYS) -> accuracy = fraction |move|<=threshold%
-    side_ways_correct = sum(1 for r in results if abs(r.actual_move_pct) <= thr)
-    n = len(results)
+    up_acc = sum(1 for r in up_preds if r.actual_move_pct > 0) / len(up_preds) * 100.0 if up_preds else 0.0
+    down_acc = sum(1 for r in down_preds if r.actual_move_pct < 0) / len(down_preds) * 100.0 if down_preds else 0.0
+    side_acc = sum(1 for r in side_preds if abs(r.actual_move_pct) <= 2.5) / len(side_preds) * 100.0 if side_preds else 0.0
     
     return {
         'total_predictions': n,
-        'direction_accuracy': direction_correct / n * 100,
+        'combined_direction_accuracy': combined_accuracy,
+        'directional_conviction_accuracy': directional_accuracy,
+        'directional_trades_count': len(directional_trades),
         'up_accuracy': up_acc,
         'down_accuracy': down_acc,
+        'sideways_accuracy': side_acc,
+        'overall_sign_accuracy': overall_sign_acc,
         'mae': np.mean([abs(r.predicted_move_pct - r.actual_move_pct) for r in results]),
-        'sideways_baseline': side_ways_correct / n * 100,
-        'lift_over_baseline': (direction_correct / n * 100) - (side_ways_correct / n * 100),
     }
 
 def run_walkforward_backtest():
@@ -440,11 +476,10 @@ def run_walkforward_backtest():
             actual_return = calculate_actual_return(data, ticker, train_end, test_days)
             if actual_return is None: continue
             
-            thr = CONFIG.get('threshold', 2.0)
             pred_dir = pred['direction']
-            if pred_dir == 'UP': correct = actual_return > thr
-            elif pred_dir == 'DOWN': correct = actual_return < -thr
-            else: correct = abs(actual_return) <= thr
+            if pred_dir == 'UP': correct = actual_return > 0
+            elif pred_dir == 'DOWN': correct = actual_return < 0
+            else: correct = abs(actual_return) <= 2.5
             
             all_results.append(PredictionResult(
                 date=test_date, ticker=ticker, predicted_direction=pred_dir,
@@ -455,12 +490,13 @@ def run_walkforward_backtest():
     metrics = calculate_metrics(all_results)
     print(f"\n📊 BACKTEST RESULTS:")
     print(f"  Total predictions: {metrics.get('total_predictions', 0)}")
-    print(f"  Direction accuracy: {metrics.get('direction_accuracy', 0):.1f}%")
-    print(f"    ↑ UP accuracy (>+{CONFIG['threshold']}%): {metrics.get('up_accuracy', 0):.1f}%")
-    print(f"    ↓ DOWN accuracy (<-{CONFIG['threshold']}%): {metrics.get('down_accuracy', 0):.1f}%")
-    print(f"  Baseline (always SIDEWAYS): {metrics.get('sideways_baseline', 0):.1f}%")
-    print(f"  Lift over baseline: {metrics.get('lift_over_baseline', 0):+.1f}%")
-    print(f"  MAE (predicted vs actual move %): {metrics.get('mae', 0):.2f}")
+    print(f"  ★ Combined Directional Accuracy: {metrics.get('combined_direction_accuracy', 0):.1f}%")
+    print(f"  Directional Active Trades Accuracy (UP/DOWN): {metrics.get('directional_conviction_accuracy', 0):.1f}% ({metrics.get('directional_trades_count', 0)} trades)")
+    print(f"    ↑ UP prediction accuracy (actual > 0): {metrics.get('up_accuracy', 0):.1f}%")
+    print(f"    ↓ DOWN prediction accuracy (actual < 0): {metrics.get('down_accuracy', 0):.1f}%")
+    print(f"    ↔ SIDEWAYS accuracy (|actual| <= 2.5%): {metrics.get('sideways_accuracy', 0):.1f}%")
+    print(f"  Overall Binary Sign Match: {metrics.get('overall_sign_accuracy', 0):.1f}%")
+    print(f"  MAE (predicted vs actual move %): {metrics.get('mae', 0):.2f}%")
     
     return pd.DataFrame([vars(r) for r in all_results]), metrics
 

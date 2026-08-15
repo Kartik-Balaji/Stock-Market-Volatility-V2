@@ -8,7 +8,7 @@
 data:
   market: "BSE"
   train_start: "2018-01-01"
-  train_end: "2023-12-31"
+  train_end: null # defaults to current date
   
   # Feature windows (days)
   windows:
@@ -17,14 +17,14 @@ data:
     long: 60
   
   # Graph settings
-  correlation_threshold: 0.4
+  correlation_threshold: 0.3
   update_graph_frequency: "monthly"
 
 # ===================
 # Universe Definition
 # ===================
 universe:
-  index: "NIFTY_500"     # Options: NIFTY_50, NIFTY_100, NIFTY_500
+  index: "NIFTY_100"     # Options: NIFTY_50, NIFTY_100, NIFTY_500
   exchange_suffix: ".BO" # Use .BO for BSE, .NS for NSE
 
 # ===================
@@ -41,13 +41,13 @@ api_limits:
 model:
   # GNN
   gnn_hidden_dim: 128
-  gnn_num_layers: 3
-  gnn_heads: 4
+  gnn_num_layers: 2
+  gnn_heads: 2
   gnn_dropout: 0.3
   
   # TCN
   tcn_hidden_dim: 256
-  tcn_num_layers: 7
+  tcn_num_layers: 5
   tcn_kernel_size: 3
   tcn_dropout: 0.3
   

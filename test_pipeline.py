@@ -86,7 +86,7 @@ try:
     print(f"  ✓ Feature columns: {list(features_dict[first_ticker].columns)}")
     
     # Convert to tensor
-    tensor, feature_names, dates = features_to_tensor(features_dict, tickers)
+    tensor, feature_names, dates, valid_tickers = features_to_tensor(features_dict, tickers)
     print(f"  ✓ Tensor shape: {tensor.shape} [T x N_stocks x N_features]")
     print(f"  ✓ Valid dates: {len(dates)} (after dropping NaN)")
     
